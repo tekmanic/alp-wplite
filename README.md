@@ -1,0 +1,2 @@
+# deb-wplite
+Wordpress + SQLite 
