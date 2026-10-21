@@ -1,0 +1,7 @@
+wplite
+
+# ignore the wp-content directory and tar.gz
+wp-content.tar.gz
+wp-content/*
+
+wplite/wp-content

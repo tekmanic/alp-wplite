@@ -1,0 +1,16 @@
+# Ignore OS specific files
+.DS_Store
+.AppleDouble
+.LSOverride
+.Trashes
+
+# Ignore test/build/doc output directories/files
+coverage/*
+build/*
+host/build/*
+bin/*
+test/*
+dist/*
+vendor/*
+vendor
+tmp

@@ -1,0 +1,18 @@
+#!/sbin/openrc-run
+
+name="php-fpm"
+description="The PHP FastCGI Process Manager"
+command="/usr/local/sbin/php-fpm"
+command_args="-D"
+pidfile="/run/php-fpm.pid"
+command_background="yes"
+
+depend() {
+    need net
+    use logger dns
+    after firewall
+}
+
+start_pre() {
+    checkpath --directory --owner php:php /run/php-fpm
+}
