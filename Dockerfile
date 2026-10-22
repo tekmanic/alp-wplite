@@ -1,14 +1,18 @@
 FROM php:8.5-fpm-alpine
 
 # set version for wordpress and sha1
-# DO NOT UPDATE HERE, UPDATE in Makefile
-ARG WPLITE_VERSION=7.0.3
-ENV WPLITE_VERSION=7.0.3
-ARG WPLITE_SHA1=344b74d7cbf13c55ba0f12cad207c06cfee4368a
+# These are the build-time defaults. The weekly update job (update.sh) rolls the
+# image forward by rebuilding with:
+#   docker build --build-arg WPLITE_VERSION=<latest> --build-arg WPLITE_SHA1=<sha1>
+# so the version is fully parameterized (no hardcoded copies to keep in sync).
+ARG WPLITE_VERSION=7.1.3
+ARG WPLITE_SHA1=491a78c7676b15dffcc69130c6054b8f49228a91
+ENV WPLITE_VERSION=${WPLITE_VERSION}
 ENV WPLITE_SHA1=${WPLITE_SHA1}
-RUN echo WPLITE_VERSION: ${WPLITE_VERSION} ${WPLITE_SHA1}
+RUN echo "WPLITE_VERSION: ${WPLITE_VERSION} ${WPLITE_SHA1}"
 
-ENV WORDPRESS_DEBUG=true
+# NOTE: WORDPRESS_DEBUG is intentionally NOT forced on. It defaults to off (see
+# wp-config-docker.php). Set WORDPRESS_DEBUG=true at runtime to enable debugging.
 
 # persistent dependencies
 RUN set -eux; \
@@ -111,8 +115,26 @@ RUN { \
 		echo 'html_errors = Off'; \
 	} > /usr/local/etc/php/conf.d/error-logging.ini
 
+# Security hardening: disable dangerous PHP functions (mirrors deb-wordpress).
+# These are not needed by WordPress at runtime and are common post-exploitation
+# / RCE vectors. (phpinfo is left enabled so plugin "system status" pages work;
+# the exposed /info.php page is removed instead.)
+RUN { \
+		echo 'disable_functions = exec,passthru,shell_exec,system,proc_open,proc_close,proc_terminate,popen,curl_multi_exec,parse_ini_file,show_source'; \
+	} > /usr/local/etc/php/conf.d/security-hardening.ini
+
+# Realistic PHP upload/execution limits. The .htaccess php_value directives do NOT
+# apply under nginx+php-fpm, so set them here where they actually take effect.
+RUN { \
+		echo 'upload_max_filesize = 64M'; \
+		echo 'post_max_size = 64M'; \
+		echo 'memory_limit = 256M'; \
+		echo 'max_execution_time = 120'; \
+		echo 'max_input_time = 120'; \
+	} > /usr/local/etc/php/conf.d/limits.ini
+
 RUN set -eux; \
-	version=7.0.3 \
+	version=${WPLITE_VERSION} \
 	sha1=${WPLITE_SHA1}; \
 	\
 	curl -o wordpress.tar.gz -fL "https://wordpress.org/wordpress-$version.tar.gz"; \
@@ -130,7 +152,6 @@ RUN set -eux; \
 		echo 'RewriteEngine On'; \
 		echo 'RewriteRule ^(.*) - [E=HTTP_AUTHORIZATION:%1]'; \
 		echo 'RewriteCond %{HTTP:Authorization} ^(.*)'; \
-		# echo 'RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]'; \
 		echo 'RewriteBase /'; \
 		echo 'RewriteRule ^index\.php$ - [L]'; \
 		echo 'RewriteCond %{REQUEST_FILENAME} !-f'; \
@@ -138,11 +159,12 @@ RUN set -eux; \
 		echo 'RewriteRule . /index.php [L]'; \
 		echo ''; \
 		echo '# END WordPress'; \
-		echo 'php_value upload_max_filesize 5120M';\
-		echo 'php_value post_max_size 5120M';\
-		echo 'php_value memory_limit 5120M';\
-		echo 'php_value max_execution_time 300';\
-		echo 'php_value max_input_time 300';\
+		# (kept in sync with limits.ini; inert under nginx, used if run under Apache)
+		echo 'php_value upload_max_filesize 64M';\
+		echo 'php_value post_max_size 64M';\
+		echo 'php_value memory_limit 256M';\
+		echo 'php_value max_execution_time 120';\
+		echo 'php_value max_input_time 120';\
 	} > /usr/src/wordpress/.htaccess; \
 	\
 	chown -R www-data:www-data /usr/src/wordpress; \
@@ -154,7 +176,9 @@ RUN set -eux; \
 		mkdir "wp-content/$dir"; \
 	done; \
 	chown -R www-data:www-data wp-content; \
-	chmod -R 1777 wp-content; \
+	# 755 (was 1777): wp-content is owned by www-data, so it does not need to be
+	# world-writable. Bind-mount users should chown the host dir to www-data (uid 33).
+	chmod -R 755 wp-content; \
 # install the wp-cli tool
 	curl -O https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar && \
 	chmod +x wp-cli.phar && \
@@ -162,17 +186,16 @@ RUN set -eux; \
 	touch /.firstrun && \
 ## Nginx Logs
 	ln -sf /dev/stdout /var/log/nginx/access.log && \
-	ln -sf /dev/stderr /var/log/nginx/error.log && \
-	echo "<?php phpinfo(); ?>" > /usr/src/wordpress/info.php
+	ln -sf /dev/stderr /var/log/nginx/error.log
 
 COPY root/ /
 
 WORKDIR /usr/src/wordpress/
 
-# COPY --chown=www-data:www-data wordpress.db /usr/src/wordpress/wp-content/
 COPY --chown=www-data:www-data wp-config-docker.php /usr/src/wordpress/wp-config-docker.php
 
-RUN chmod 777 /init.sh /etc/init.d/php-fpm
+# 755 (was 777): the entrypoint and init script need to be executable, not world-writable.
+RUN chmod 755 /init.sh /etc/init.d/php-fpm
 
 # reduce privilege-escalation surface from utilities not needed at runtime
 RUN set -eux; \
@@ -193,13 +216,22 @@ RUN set -eux; \
 		if [ -e "$f" ]; then chmod ug-s "$f"; fi; \
 	done
 
+# Remove any remaining setuid/setgid bits to prevent privilege escalation (mirrors deb-wordpress)
+RUN find / -xdev -perm /6000 -type f -exec chmod a-s {} + 2>/dev/null || true
+
+# Persist wp-content (themes, plugins, uploads, and the SQLite database at
+# wp-content/wordpress.db) so it survives container recreation (docker rm + docker
+# run). Without this, the DB lives in the container's writable layer and is deleted
+# when the container is removed. Mount a named volume to keep it, e.g.:
+#   -v wplite-content:/usr/src/wordpress/wp-content
+VOLUME /usr/src/wordpress/wp-content
+
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
 	CMD php -r '$s=@fsockopen("127.0.0.1",80); if(!$s){exit(1);} fclose($s);'
 
 ENTRYPOINT ["/init.sh"]
-# CMD tail -f /dev/null
 
 LABEL author="tekmanic" \
-    version=7.0.3 \
+    version=${WPLITE_VERSION} \
     documentation="https://github.com/tekmanic/alp-wplite" \
     license="MIT"
